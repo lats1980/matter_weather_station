@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
+#include <ei_wrapper.h>
+
 #include "app_task.h"
 
 #include "battery.h"
@@ -30,7 +32,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_DECLARE(app);
+LOG_MODULE_DECLARE(app, CONFIG_CHIP_APP_LOG_LEVEL);
 
 using namespace ::chip;
 using namespace ::chip::DeviceLayer;
@@ -44,6 +46,9 @@ enum class LedState { kAlive, kAdvertisingBle, kConnectedBle, kProvisioned };
 #if CONFIG_AVERAGE_CURRENT_CONSUMPTION <= 0
 #error Invalid CONFIG_AVERAGE_CURRENT_CONSUMPTION value set
 #endif
+
+#define SHIFT_WINDOWS		0
+#define SHIFT_FRAMES		100
 
 constexpr size_t kMeasurementsIntervalMs = 3000;
 constexpr uint8_t kTemperatureMeasurementEndpointId = 1;
@@ -74,11 +79,29 @@ constexpr uint32_t kDeviceAverageCurrentConsumptionUa = CONFIG_AVERAGE_CURRENT_C
 constexpr uint32_t kFullBatteryOperationTime = kBatteryCapacityUaH / kDeviceAverageCurrentConsumptionUa * 3600;
 /* It is recommended to toggle the signalled state with 0.5 s interval. */
 constexpr size_t kIdentifyTimerIntervalMs = 500;
+/* Number of accelerometer channels. */
+constexpr uint8_t kAccelerometerChannels = 3;
+/* Accelerometer sample interval in ms. */
+constexpr size_t kAccMeasurementsIntervalMs = 10;
+/* Label of Normal. */
+constexpr char kNormalLabel[] = "Normal";
+/* Label of Unbalance. */
+constexpr char kUnbalanceLabel[] = "Unbala";
 
 k_timer sMeasurementsTimer;
 k_timer sIdentifyTimer;
+k_timer sAccMeasurementsTimer;
+
+enum {
+	ML_DROP_RESULT			= BIT(0),
+	ML_CLEANUP_REQUIRED		= BIT(1),
+	ML_FIRST_PREDICTION		= BIT(2),
+	ML_RUNNING			= BIT(3),
+};
+uint8_t ml_control;
 
 const device *sBme688SensorDev = DEVICE_DT_GET_ONE(bosch_bme680);
+const device *sAdxl362SensorDev = DEVICE_DT_GET_ONE(adi_adxl362);
 
 /* Add identify for all endpoints */
 Identify sIdentifyTemperature = { chip::EndpointId{ kTemperatureMeasurementEndpointId }, AppTask::OnIdentifyStart,
@@ -90,9 +113,139 @@ Identify sIdentifyPressure = { chip::EndpointId{ kPressureMeasurementEndpointId 
 
 } /* namespace */
 
+static int buf_cleanup(void)
+{
+	bool cancelled = false;
+	int err = ei_wrapper_clear_data(&cancelled);
+
+	if (!err) {
+		if (cancelled) {
+			ml_control &= ~ML_RUNNING;
+		}
+		if (ml_control & ML_RUNNING) {
+			ml_control |= ML_DROP_RESULT;
+		}
+		ml_control &= ~ML_CLEANUP_REQUIRED;
+		ml_control |= ML_FIRST_PREDICTION;
+	} else if (err == -EBUSY) {
+		LOG_ERR("Cannot cleanup buffer (err: %d)", err);
+		ml_control |= ML_DROP_RESULT;
+		ml_control |= ML_CLEANUP_REQUIRED;
+	} else {
+		LOG_ERR("Cannot cleanup buffer (err: %d)", err);
+	}
+
+	return err;
+}
+
+static void start_prediction(void)
+{
+	int err;
+	size_t window_shift;
+	size_t frame_shift;
+
+	if (ml_control & ML_RUNNING) {
+		return;
+	}
+
+	if (ml_control & ML_CLEANUP_REQUIRED) {
+		err = buf_cleanup();
+		if (err) {
+			return;
+		}
+	}
+
+	if (ml_control & ML_FIRST_PREDICTION) {
+		window_shift = 0;
+		frame_shift = 0;
+	} else {
+		window_shift = SHIFT_WINDOWS;
+		frame_shift = SHIFT_FRAMES;
+	}
+
+	err = ei_wrapper_start_prediction(window_shift, frame_shift);
+	if (!err) {
+		ml_control |= ML_RUNNING;
+		ml_control &= ~ML_FIRST_PREDICTION;
+	} else {
+		LOG_ERR("Cannot start prediction (err: %d)", err);
+	}
+}
+
+void AppTask::ResultReadyHandler(int err)
+{
+	bool drop_result = (err) || (ml_control & ML_DROP_RESULT);
+
+	if (err) {
+		LOG_ERR("Result ready callback returned error (err: %d)", err);
+	} else {
+		ml_control &= ~ML_DROP_RESULT;
+		ml_control &= ~ML_RUNNING;
+		start_prediction();
+	}
+
+	if (!drop_result) {
+		int ret;
+		const char *label;
+		float value;
+		size_t idx;
+		float anomaly;
+
+		ret = ei_wrapper_get_next_classification_result(&label, &value, &idx);
+		if (!ret) {
+			if (!label) {
+				LOG_ERR("Returned label is NULL");
+				return;
+			}
+			LOG_ERR("%s, %f", label, value);
+			if (strncmp(label, kNormalLabel, strlen(kNormalLabel)) == 0) {
+				LOG_INF("Normal");
+			} else if (strncmp(label, kUnbalanceLabel, strlen(kUnbalanceLabel)) == 0) {
+				LOG_INF("Unbalance");
+			} else {
+				LOG_INF("Ignore result");
+			}
+		} else {
+			ret = ei_wrapper_get_anomaly(&anomaly);
+			if (!ret) {
+				LOG_ERR("anomaly:%f", anomaly);
+			} else {
+				LOG_ERR("Fail to retrieve anomaly");
+			}
+		}
+	} else {
+		LOG_ERR("drop_result");
+	}
+}
+
 void AppTask::MeasurementsTimerHandler()
 {
 	Instance().UpdateClustersState();
+}
+
+void AppTask::AccMeasurementsTimerHandler()
+{
+	struct sensor_value data[kAccelerometerChannels];
+	int ret;
+	float float_data[kAccelerometerChannels];
+
+	ret = sensor_sample_fetch(sAdxl362SensorDev);
+	if (ret != 0) {
+		LOG_ERR("Fetching data from ADXL362 sensor failed with: %d", ret);
+	} else {
+		ret = sensor_channel_get(sAdxl362SensorDev, SENSOR_CHAN_ACCEL_XYZ, &data[0]);
+		if (ret) {
+			LOG_ERR("sensor_channel_get, error: %d", ret);
+		} else {
+			for (size_t i = 0; i < kAccelerometerChannels; i++) {
+				float_data[i] = sensor_value_to_double(&data[i]);
+			}
+			ret = ei_wrapper_add_data(float_data, kAccelerometerChannels);
+			if (ret) {
+				LOG_ERR("Cannot add data for EI wrapper (err %d)", ret);
+			}
+		}
+	}
 }
 
 void AppTask::OnIdentifyStart(Identify *)
@@ -360,6 +513,11 @@ CHIP_ERROR AppTask::Init()
 		return chip::System::MapErrorZephyr(-ENODEV);
 	}
 
+	if (!device_is_ready(sAdxl362SensorDev)) {
+		LOG_ERR("ADXL362 sensor device not ready");
+		return chip::System::MapErrorZephyr(-ENODEV);
+	}
+
 	int ret = BatteryMeasurementInit();
 	if (ret) {
 		LOG_ERR("Battery measurement init failed");
@@ -384,12 +542,23 @@ CHIP_ERROR AppTask::Init()
 		return chip::System::MapErrorZephyr(ret);
 	}
 
+	ml_control |= ML_FIRST_PREDICTION;
+	ret = ei_wrapper_init(ResultReadyHandler);
+	if (ret) {
+		LOG_ERR("ei_wrapper_init() failed");
+		return chip::System::MapErrorZephyr(ret);
+	}
+
 	/* Initialize timers */
 	k_timer_init(
 		&sMeasurementsTimer, [](k_timer *) { Nrf::PostTask([] { MeasurementsTimerHandler(); }); }, nullptr);
 	k_timer_init(
 		&sIdentifyTimer, [](k_timer *) { Nrf::PostTask([] { IdentifyTimerHandler(); }); }, nullptr);
 	k_timer_start(&sMeasurementsTimer, K_MSEC(kMeasurementsIntervalMs), K_MSEC(kMeasurementsIntervalMs));
+	k_timer_init(
+		&sAccMeasurementsTimer, [](k_timer *) { Nrf::PostTask([] { AccMeasurementsTimerHandler(); }); }, nullptr);
+	k_timer_start(&sAccMeasurementsTimer, K_MSEC(kAccMeasurementsIntervalMs), K_MSEC(kAccMeasurementsIntervalMs));
+	start_prediction();
 
 	return Nrf::Matter::StartServer();
 }

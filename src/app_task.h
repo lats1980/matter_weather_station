@@ -34,6 +34,8 @@ private:
 	void UpdateRelativeHumidityClusterState();
 	void UpdatePowerSourceClusterState();
 
+	static void ResultReadyHandler(int err);
+	static void AccMeasurementsTimerHandler();
 	static void MeasurementsTimerHandler();
 	static void IdentifyTimerHandler();
 
